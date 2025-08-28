@@ -1,0 +1,79 @@
+#Import Libraries and Load Annotations
+
+import os
+import json
+
+MOUNT_FOLDER = "/tmp/dataset"
+
+ANNOTATIONS_PATH = "annotations/office/waste-object-tracking/real/all/latest.json"
+
+# Load the annotation JSON file
+with open(os.path.join(MOUNT_FOLDER, ANNOTATIONS_PATH)) as f:
+    annotations = json.load(f)
+
+img_map = {
+    i["id"]: {
+        "path": os.path.join(MOUNT_FOLDER, "images", i["file_name"]), 
+        "annotations": []
+    } for i in annotations["images"]
+}
+
+# Build a category mapping (e.g., {1: "PAPER CUP", 2: "PAPER SHEET", ...})
+cat_map = {c["id"]: c["name"] for c in annotations["categories"]}
+
+# Associate each annotation with the corresponding image entry in img_map
+for a in annotations["annotations"]:
+    if a["image_id"] in img_map:  # Safety check
+        img_map[a["image_id"]]["annotations"].append(a)
+
+print(f"Loaded annotations with {len(annotations['images'])} images and {len(annotations['annotations'])} polygons")
+
+
+#Filtering Images
+from PIL import Image
+import os
+
+def filter_bad_images(img_map):
+    good_img_map = {}
+    bad_files = []
+
+    for img_id, entry in img_map.items():
+        path = entry["path"]
+        try:
+            with Image.open(path) as img:
+                img.verify()  # Verify will raise an exception if image is corrupted
+            good_img_map[img_id] = entry  # Only keep valid images
+        except Exception as e:
+            print(f"Bad image detected: {path} | Error: {e}")
+            bad_files.append(path)
+
+    print(f"\nFiltering complete: {len(bad_files)} bad images found and excluded.")
+    return good_img_map, bad_files
+
+# Usage:
+img_map, bad_files = filter_bad_images(img_map)
+
+
+# Cell 0: Split data
+
+image_ids = sorted(list(img_map.keys()))  # maintain natural order (sorted by id or filename)
+
+
+train_cut = int(len(image_ids) * 0.8)
+val_cut = int(len(image_ids) * 0.95)
+
+train_ids = set(image_ids[:train_cut])
+val_ids   = set(image_ids[train_cut:val_cut])
+test_ids  = set(image_ids[val_cut:])
+
+split_map = {
+    **{i: "train" for i in train_ids},
+    **{i: "val"   for i in val_ids},
+    **{i: "test"  for i in test_ids},
+}
+
+with open("split_map.json", "w") as f:
+    json.dump(split_map, f)
+
+print(f"Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_ids)}")
+
