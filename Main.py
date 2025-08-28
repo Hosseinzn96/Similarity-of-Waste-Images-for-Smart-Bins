@@ -422,7 +422,7 @@ def match_objects_with_category_check(embeddings_a, embeddings_b, metas_a, metas
     return matches, unmatched_a, unmatched_b
 
 
-# Cell 5.1: Pick, Match & Visualize 
+# Cell 9: Pick, Match & Visualize 
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -542,7 +542,6 @@ plt.show()
 
 
 #Cell 10: Calculation of added objects
-
 import os
 import matplotlib.pyplot as plt
 import tensorflow as tf
@@ -581,6 +580,443 @@ axes[1].axis('off')
 
 plt.tight_layout()
 plt.show()
+
+
+# Cell 11: Triplet Loss Function
+import tensorflow as tf
+
+def triplet_loss(anchor, positive, negative, margin=0.3):  
+    """
+    Computes triplet loss using cosine distance.
+
+    Args:
+        anchor, positive, negative: Embedding vectors (B, D)
+        margin: float, enforced margin between positive and negative distances
+
+    Returns:
+        Tensor loss value
+    """
+    # Normalize for cosine similarity
+    anchor = tf.math.l2_normalize(anchor, axis=-1)
+    positive = tf.math.l2_normalize(positive, axis=-1)
+    negative = tf.math.l2_normalize(negative, axis=-1)
+
+    # Cosine similarity → convert to distance
+    sim_ap = tf.reduce_sum(anchor * positive, axis=-1)  # similarity(anchor, pos)
+    sim_an = tf.reduce_sum(anchor * negative, axis=-1)  # similarity(anchor, neg)
+
+    loss = tf.maximum(0.0, margin + sim_an - sim_ap)
+    return tf.reduce_mean(loss)
+
+
+
+#Cell 12: generate triplets_loss 
+
+import random
+import numpy as np
+
+# ----------------------------- #
+# OPTIONAL BIN FILTERING HELPER #
+# ----------------------------- #
+
+def should_generate_triplets(similarity_matrix, bin_threshold=0.75):
+    """
+    Decide if this image pair should generate triplets based on object similarity.
+
+    Args:
+        similarity_matrix: numpy array, cosine similarity matrix between objects A and B
+        bin_threshold: float, threshold for deciding same bin (default 0.75)
+
+    Returns:
+        bool → True if triplets should be generated (same bin), False to skip (different bin)
+    """
+    return np.any(similarity_matrix > bin_threshold)
+
+
+# ----------------------------- #
+# TRIPLET GENERATION FUNCTION   #
+# ----------------------------- #
+
+def generate_triplets_loss(img_map, embedding_model, split_name="train",
+                           threshold_pos=0.67, threshold_neg=0.48,        #pos=73, neg=0.44
+                           img_size=(224, 224), 
+                           max_per_image=20, 
+                           num_passes=1,
+                           enable_bin_filtering=False):  # CONTROL BIN FILTERING HERE
+    """
+    Generate triplets with multiple passes through dataset for higher coverage.
+
+    Args:
+        enable_bin_filtering: bool → Set to True to enable bin filtering (skip unrelated image pairs).
+    """
+
+    anchors, positives, negatives = [], [], []
+    entries = [v for k, v in img_map.items() if split_map.get(k) == split_name]
+    entries.sort(key=lambda x: x['path'])  # Consistent order
+
+    for pass_num in range(num_passes):
+        print(f"Triplet generation pass {pass_num + 1}/{num_passes}")
+
+        for idx in range(len(entries) - 1):
+            img_a = entries[idx]
+            img_b = entries[idx + 1]
+
+            crops_a, metas_a = load_and_crop_objects(img_a, img_size)
+            crops_b, metas_b = load_and_crop_objects(img_b, img_size)
+
+            if not crops_a or not crops_b:
+                continue
+
+            embeddings_a = generate_embeddings(crops_a, embedding_model)
+            embeddings_b = generate_embeddings(crops_b, embedding_model)
+
+            similarity = compute_cosine_similarity(embeddings_a, embeddings_b)
+
+            # --------------------------------------- #
+            # OPTIONAL BIN FILTERING (SAFE TO COMMENT) #
+            # --------------------------------------- #
+            
+            if enable_bin_filtering:
+                if not should_generate_triplets(similarity):
+                    # Skip this pair → likely different bin → do not generate triplets
+                    continue
+
+            triplet_count = 0
+            used_b = set()  # To ensure each B object is used only once as positive
+
+            for i, meta_a in enumerate(metas_a):
+                cat_a = meta_a['category_id']
+
+                # Positive candidates (same category + above threshold + not used yet)
+                candidates_pos = [
+                    j for j, meta_b in enumerate(metas_b)
+                    if meta_b['category_id'] == cat_a and similarity[i, j] >= threshold_pos and j not in used_b
+                ]
+
+                if not candidates_pos:
+                    continue
+
+                # Choose best positive (highest similarity)
+                j = max(candidates_pos, key=lambda idx: similarity[i, idx])
+                used_b.add(j)
+
+                anchors.append(crops_a[i])
+                positives.append(crops_b[j])
+
+                # Negative selection (same category, low similarity preferred)
+                neg = None
+                for m_idx, meta_b in enumerate(metas_b):
+                    if meta_b['category_id'] == cat_a and similarity[i, m_idx] <= threshold_neg:
+                        neg = crops_b[m_idx]
+                        break
+
+                # Fallback negative (random object from other image)
+                if neg is None:
+                    while True:
+                        neg_entry = random.choice(entries)
+                        if neg_entry in [img_a, img_b]:
+                            continue
+                        neg_crops, neg_metas = load_and_crop_objects(neg_entry, img_size)
+                        if not neg_crops:
+                            continue
+                        k = random.randint(0, len(neg_crops) - 1)
+                        neg = neg_crops[k]
+                        break
+
+                negatives.append(neg)
+
+                triplet_count += 1
+                if triplet_count >= max_per_image:
+                    break
+
+    print(f"Generated total {len(anchors)} triplets.")
+    return anchors, positives, negatives
+
+
+
+#Cell 13(1): generate validation triplets
+import pickle
+import os
+import tensorflow as tf
+
+# ---- CONFIG ----
+MAX_VAL_TRIPLETS = 5500  # Maximum triplets to generate and save
+
+# ---- GENERATE ----
+anchors_val, positives_val, negatives_val = generate_triplets_loss(
+    img_map,
+    embedding_model,
+    split_name="val"  # Use val split
+)
+
+# Check total generated
+total_val_triplets = len(anchors_val)
+print("Total generated validation triplets:", total_val_triplets)
+
+# ---- TRIM IF NEEDED ----
+if total_val_triplets > MAX_VAL_TRIPLETS:
+    print(f"Trimming validation triplets to {MAX_VAL_TRIPLETS}")
+    anchors_val = anchors_val[:MAX_VAL_TRIPLETS]
+    positives_val = positives_val[:MAX_VAL_TRIPLETS]
+    negatives_val = negatives_val[:MAX_VAL_TRIPLETS]
+
+# ---- CONVERT TO NUMPY ----
+anchors_val_np = tf.stack(anchors_val).numpy()
+positives_val_np = tf.stack(positives_val).numpy()
+negatives_val_np = tf.stack(negatives_val).numpy()
+
+# ---- SAVE ----
+save_path = "saved_triplets/val_triplets_Xception.pkl"
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+with open(save_path, "wb") as f:
+    pickle.dump({
+        "anchors": anchors_val_np,
+        "positives": positives_val_np,
+        "negatives": negatives_val_np
+    }, f)
+
+print("Saved validation triplets to:", save_path)
+
+
+#Cell 13(2): Load Validation Triplets
+
+import pickle
+
+# Load triplets
+val_triplet_path = "saved_triplets/val_triplets_for_mobilenet.pkl"
+
+#"saved_triplets/val_triplets.pkl"  for  Resnet50
+#saved_triplets/val_triplets2.pkl for resnet50 2
+#"saved_triplets/val_triplets_for_ResNet101.pkl
+#"saved_triplets/val_triplets_for_mobilenet.pkl"  for mobilenet
+#"saved_triplets/val_triplets_for_mobilenetV2.pkl"
+
+with open(val_triplet_path, "rb") as f:
+    val_triplets = pickle.load(f)
+
+anchors_val = val_triplets["anchors"]
+positives_val = val_triplets["positives"]
+negatives_val = val_triplets["negatives"]
+
+print("Loaded triplets shapes:")
+print("Anchors:", anchors_val.shape)
+print("Positives:", positives_val.shape)
+print("Negatives:", negatives_val.shape)
+
+
+
+#Cell 13(3): Visualize Valid Triplets
+import matplotlib.pyplot as plt
+import numpy as np
+
+# How many triplets to show
+num_samples = 5
+
+# Random indices
+indices = np.random.choice(anchors_val.shape[0], size=num_samples, replace=False)
+
+# Plot
+fig, axes = plt.subplots(num_samples, 3, figsize=(10, num_samples * 3))
+
+for idx, triplet_idx in enumerate(indices):
+    anchor_img = anchors_val[triplet_idx]
+    positive_img = positives_val[triplet_idx]
+    negative_img = negatives_val[triplet_idx]
+    
+    # Anchor
+    axes[idx, 0].imshow(anchor_img)
+    axes[idx, 0].set_title("Anchor")
+    axes[idx, 0].axis('off')
+    
+    # Positive
+    axes[idx, 1].imshow(positive_img)
+    axes[idx, 1].set_title("Positive")
+    axes[idx, 1].axis('off')
+    
+    # Negative
+    axes[idx, 2].imshow(negative_img)
+    axes[idx, 2].set_title("Negative")
+    axes[idx, 2].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+
+#Cell 13(4): generate Train triplets
+
+import pickle
+import os
+import tensorflow as tf
+
+# ---- GENERATE ----
+anchors_train, positives_train, negatives_train = generate_triplets_loss(
+    img_map,
+    embedding_model,
+    split_name="train"  #  Full train part, no trimming
+)
+
+# ---- CONVERT TO NUMPY ----
+anchors_train_np = tf.stack(anchors_train).numpy()
+positives_train_np = tf.stack(positives_train).numpy()
+negatives_train_np = tf.stack(negatives_train).numpy()
+
+# ---- SAVE TO FILE ----
+save_path = "saved_triplets/Xception.pkl"
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+with open(save_path, "wb") as f:
+    pickle.dump({
+        "anchors": anchors_train_np,
+        "positives": positives_train_np,
+        "negatives": negatives_train_np
+    }, f)
+
+print("Saved all train triplets to:", save_path)
+print("Triplet counts:", len(anchors_train_np))
+
+
+
+##Cell 13(5): Load Train triplets
+import pickle
+
+train_triplet_path = "saved_triplets/train_triplets_for_mobilenet.pkl"
+
+
+with open(train_triplet_path, "rb") as f:
+    train_triplets = pickle.load(f)
+
+anchors_train = train_triplets["anchors"]
+positives_train = train_triplets["positives"]
+negatives_train = train_triplets["negatives"]
+
+print("Loaded triplets:")
+print("Anchors shape:  ", anchors_train.shape)
+print("Positives shape:", positives_train.shape)
+print("Negatives shape:", negatives_train.shape)
+
+
+
+####Cell 13(6):Visualize Train Triplets
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Number of triplets to show
+num_samples = 5
+
+# Randomly pick 10 indices
+indices = np.random.choice(anchors_train.shape[0], size=num_samples, replace=False)
+
+# Plot
+fig, axes = plt.subplots(num_samples, 3, figsize=(10, num_samples * 3))
+
+for idx, triplet_idx in enumerate(indices):
+    anchor_img = anchors_train[triplet_idx]
+    positive_img = positives_train[triplet_idx]
+    negative_img = negatives_train[triplet_idx]
+    
+    # Anchor
+    axes[idx, 0].imshow(anchor_img)
+    axes[idx, 0].set_title("Anchor")
+    axes[idx, 0].axis('off')
+    
+    # Positive
+    axes[idx, 1].imshow(positive_img)
+    axes[idx, 1].set_title("Positive")
+    axes[idx, 1].axis('off')
+    
+    # Negative
+    axes[idx, 2].imshow(negative_img)
+    axes[idx, 2].set_title("Negative")
+    axes[idx, 2].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+# Cell 14:  tf.data pipeline for triplet training
+
+def create_triplet_dataset(anchors, positives, negatives, batch_size=32, shuffle=True, img_size=(224, 224)):
+    if len(anchors) == 0:
+        print("No triplets to create dataset → returning empty dataset.")
+        dummy = tf.zeros((0, img_size[0], img_size[1], 3))
+        return tf.data.Dataset.from_tensor_slices(((dummy, dummy, dummy), tf.zeros((0,)))).batch(batch_size)
+
+    # Stack tensors
+    anchors = tf.stack(anchors)
+    positives = tf.stack(positives)
+    negatives = tf.stack(negatives)
+
+    # Create tuple-style dataset     
+    ds = tf.data.Dataset.from_tensor_slices(((anchors, positives, negatives), tf.zeros((anchors.shape[0],))))  #triplets are then wrapped into a tf.data.Dataset object using from_tensor_sli
+
+    if shuffle:
+        ds = ds.shuffle(1024)
+
+    ds = ds.batch(batch_size)
+    return ds
+
+
+# Create train_ds and val_ds
+
+train_ds = create_triplet_dataset(
+    anchors_train, positives_train, negatives_train,
+    batch_size=32, shuffle=True
+)
+
+val_ds = create_triplet_dataset(
+    anchors_val, positives_val, negatives_val,
+    batch_size=32, shuffle=False
+)
+
+# Only count once
+train_batches = sum(1 for _ in train_ds)
+val_batches = sum(1 for _ in val_ds)
+
+print("Datasets ready!")
+print("Train batches:", train_batches)
+print("Val batches:", val_batches)
+
+
+
+#Cell 15: Imports & Custom Triplet Loss Function
+import tensorflow as tf
+import numpy as np
+from sklearn.model_selection import train_test_split
+import os
+
+# Custom Triplet Loss (based on cosine similarity)
+def custom_triplet_loss(anchor, positive, negative, margin=0.3):
+    anchor = tf.math.l2_normalize(anchor, axis=-1)
+    positive = tf.math.l2_normalize(positive, axis=-1)
+    negative = tf.math.l2_normalize(negative, axis=-1)
+
+    pos_sim = tf.reduce_sum(anchor * positive, axis=-1)
+    neg_sim = tf.reduce_sum(anchor * negative, axis=-1)
+
+    loss = tf.maximum(0.0, margin - pos_sim + neg_sim)
+    return tf.reduce_mean(loss)
+
+# Wrap into Keras-compatible loss
+class TripletLoss(tf.keras.losses.Loss):
+    def __init__(self, margin=0.2):
+        super().__init__()
+        self.margin = margin
+
+    def call(self, y_true, y_pred):
+        anchor, positive, negative = tf.split(y_pred, num_or_size_splits=3, axis=1)
+        return custom_triplet_loss(anchor, positive, negative, self.margin)
+
+
+
+
+
+
+
 
 
 
