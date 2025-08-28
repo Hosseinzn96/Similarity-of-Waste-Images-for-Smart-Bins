@@ -77,3 +77,18 @@ with open("split_map.json", "w") as f:
 
 print(f"Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_ids)}")
 
+
+#Load Dataset
+import json
+from pathlib import Path
+
+in_path = Path("split_map1.json")   #split_map.json
+with in_path.open("r") as f:
+    split_map = {int(k): v for k, v in json.load(f).items()}
+
+print(f"Loaded split_map with {len(split_map)} entries")
+print("Train:", sum(1 for v in split_map.values() if v == "train"),
+      "Val:", sum(1 for v in split_map.values() if v == "val"),
+      "Test:", sum(1 for v in split_map.values() if v == "test"))
+
+
